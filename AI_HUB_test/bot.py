@@ -213,7 +213,7 @@ async def auth_message_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         raise ApplicationHandlerStop
 
     if context.user_data.get("awaiting_access_password"):
-        if hmac.compare_digest(incoming, ACCESS_PASSWORD):
+        if hmac.compare_digest(incoming.encode("utf-8"), ACCESS_PASSWORD.encode("utf-8")):
             with db() as con:
                 con.execute(
                     "INSERT OR IGNORE INTO authorized_users(user_id, authorized_at) VALUES(?,?)",
