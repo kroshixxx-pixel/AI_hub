@@ -154,13 +154,20 @@ async def free_models():
             continue
         name = item.get("name") or mid
         models.append({"id": mid, "name": name})
-    priority_terms = ("qwen", "kimi", "deepseek", "gemini", "llama", "nemotron", "glm", "mistral", "phi")
+    # Put current, capable general-purpose and coding models first.
+    # The list is still discovered from OpenRouter at runtime, so removed
+    # or temporarily unavailable models are not hard-coded into the bot.
+    priority_terms = (
+        "nemotron-3-ultra", "ernie-5.5", "nemotron-3.5-super-vl",
+        "deepseek", "qwen", "kimi", "llama", "mistral",
+        "nemotron-3.5-lightning", "cohere", "liquid", "glm", "phi"
+    )
     def sort_key(m):
         low = (m["id"] + " " + m["name"]).lower()
         rank = next((i for i, term in enumerate(priority_terms) if term in low), len(priority_terms))
         return (rank, m["name"].lower())
     models.sort(key=sort_key)
-    return models[:40]
+    return models[:30]
 
 
 def main_keyboard():
@@ -410,7 +417,25 @@ async def ask_model(model_id, messages):
             json=body
         )
         if response.status_code >= 400:
-            raise RuntimeError(f"OpenRouter HTTP {response.status_code}: {response.text[:500]}")
+            # Give a useful explanation for rate limits without dumping a
+            # huge provider response into the Telegram chat.
+            try:
+                err = response.json().get("error", {})
+                message = err.get("message", "Unknown API error")
+                metadata = err.get("metadata") or {}
+                limit_source = metadata.get("limit_source") or metadata.get("error_type") or ""
+            except (ValueError, AttributeError):
+                message = response.text[:250]
+                limit_source = ""
+            if response.status_code == 429:
+                retry_after = response.headers.get("Retry-After")
+                details = f" Причина: {limit_source}." if limit_source else ""
+                retry = f" Повтори через {retry_after} сек." if retry_after else " Подожди немного и попробуй снова."
+                raise RuntimeError(
+                    "OpenRouter ограничил запрос (429)." + details + retry +
+                    " Если это лимит бесплатного тарифа, смена модели его не обходит."
+                )
+            raise RuntimeError(f"OpenRouter HTTP {response.status_code}: {message[:300]}")
         data = response.json()
     return data["choices"][0]["message"]["content"]
 
