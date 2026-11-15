@@ -1,5 +1,6 @@
 import os
 import html
+import hmac
 import logging
 import sqlite3
 from datetime import datetime, timezone
@@ -9,15 +10,14 @@ from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler,
+    Application, ApplicationHandlerStop, CommandHandler, CallbackQueryHandler,
     MessageHandler, ContextTypes, filters
 )
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
-OWNER_ID_RAW = os.getenv("OWNER_ID", "").strip()
-OWNER_ID = int(OWNER_ID_RAW) if OWNER_ID_RAW else None
+ACCESS_PASSWORD = os.getenv("ACCESS_PASSWORD", "")
 DB_PATH = os.getenv("DB_PATH", "data/ai_hub.sqlite3")
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 MAX_HISTORY = 24
@@ -54,14 +54,23 @@ def init_db():
             created_at TEXT NOT NULL,
             FOREIGN KEY(chat_id) REFERENCES chats(id)
         )""")
+        con.execute("""CREATE TABLE IF NOT EXISTS authorized_users (
+            user_id INTEGER PRIMARY KEY,
+            authorized_at TEXT NOT NULL
+        )""")
 
 
 def now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def allowed(user_id):
-    return OWNER_ID is None or user_id == OWNER_ID
+def is_authorized(user_id):
+    with db() as con:
+        row = con.execute(
+            "SELECT 1 FROM authorized_users WHERE user_id=?",
+            (user_id,)
+        ).fetchone()
+    return row is not None
 
 
 def get_chats(user_id):
@@ -185,11 +194,52 @@ def chats_keyboard(chats):
     return InlineKeyboardMarkup(rows)
 
 
+
+async def auth_message_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Blocks every message from users until they enter the shared access password."""
+    user = update.effective_user
+    message = update.effective_message
+    if not user or not message:
+        return
+    if is_authorized(user.id):
+        return
+
+    incoming = (message.text or "").strip()
+    command = incoming.split(maxsplit=1)[0].split("@")[0].lower() if incoming else ""
+
+    if command == "/start":
+        context.user_data["awaiting_access_password"] = True
+        await message.reply_text("🔐 Для доступа к AI HUB введи пароль:")
+        raise ApplicationHandlerStop
+
+    if context.user_data.get("awaiting_access_password"):
+        if hmac.compare_digest(incoming, ACCESS_PASSWORD):
+            with db() as con:
+                con.execute(
+                    "INSERT OR IGNORE INTO authorized_users(user_id, authorized_at) VALUES(?,?)",
+                    (user.id, now())
+                )
+            context.user_data.pop("awaiting_access_password", None)
+            await message.reply_text("✅ Пароль верный. Доступ открыт и сохранён.")
+            await start(update, context)
+        else:
+            await message.reply_text("❌ Неверный пароль. Попробуй ещё раз:")
+        raise ApplicationHandlerStop
+
+    await message.reply_text("🔒 Доступ закрыт. Отправь /start, чтобы ввести пароль.")
+    raise ApplicationHandlerStop
+
+
+async def auth_callback_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Blocks inline-button callbacks from users who have not authenticated."""
+    query = update.callback_query
+    if query and not is_authorized(query.from_user.id):
+        await query.answer("Сначала отправь /start и введи пароль.", show_alert=True)
+        raise ApplicationHandlerStop
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if not allowed(uid):
-        await update.message.reply_text("Этот тестовый бот доступен только владельцу.")
-        return
     chats = get_chats(uid)
     if not chats:
         cid = create_chat(uid)
@@ -214,8 +264,6 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def new_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if not allowed(uid):
-        return
     cid = create_chat(uid)
     context.user_data["chat_id"] = cid
     await update.message.reply_text(
@@ -226,8 +274,6 @@ async def new_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def list_chats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if not allowed(uid):
-        return
     chats = get_chats(uid)
     if not chats:
         await update.message.reply_text("Пока нет диалогов.", reply_markup=main_keyboard())
@@ -258,8 +304,6 @@ async def show_models(target, context, chat_id):
 
 async def models_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if not allowed(uid):
-        return
     cid = context.user_data.get("chat_id")
     if not cid:
         cid = create_chat(uid)
@@ -271,9 +315,6 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     uid = q.from_user.id
-    if not allowed(uid):
-        await q.edit_message_text("Этот тестовый бот доступен только владельцу.")
-        return
     data = q.data or ""
     if data == "home":
         await q.edit_message_text("🌐 <b>AI HUB</b>\nВыбери действие:", parse_mode=ParseMode.HTML,
@@ -376,8 +417,6 @@ async def ask_model(model_id, messages):
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if not allowed(uid):
-        return
     text = (update.message.text or "").strip()
     if not text:
         return
@@ -426,7 +465,11 @@ def main():
         raise SystemExit("Не заполнен BOT_TOKEN в файле .env")
     if not OPENROUTER_API_KEY:
         raise SystemExit("Не заполнен OPENROUTER_API_KEY в файле .env")
+    if not ACCESS_PASSWORD:
+        raise SystemExit("Не заполнен ACCESS_PASSWORD в файле .env")
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    app.add_handler(MessageHandler(filters.ALL, auth_message_gate), group=-1)
+    app.add_handler(CallbackQueryHandler(auth_callback_gate), group=-1)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("new", new_chat))
